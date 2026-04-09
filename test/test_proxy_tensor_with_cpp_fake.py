@@ -13,6 +13,7 @@ re-enter C++ Fake dispatch, so all results remain C++ fake tensors.
 
 from torch.testing._internal.common_utils import TestCase, run_tests
 import torch
+import torch._dynamo
 import torch._library.simple_registry
 import torch._library.utils
 import unittest
@@ -30,7 +31,11 @@ from torch._subclasses.fake_tensor import (
 from torch._subclasses.functional_tensor import FunctionalTensor, FunctionalTensorMode
 from torch._decomp import decomposition_table
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
-from torch.testing._internal.common_device_type import ops
+from torch.testing._internal.common_device_type import ops, instantiate_device_type_tests
+from torch.testing._internal.common_methods_invocations import op_db, skip, xfail, skipOps
+from torch.testing._internal.custom_op_db import custom_op_db
+from torch.testing._internal.hop_db import hop_db
+import torch.testing._internal.optests as optests
 from torch.fx.experimental.proxy_tensor import (
     make_fx,
     DecompositionInterpreter,
@@ -757,329 +762,152 @@ def forward(self, x_1):
         self.assertEqual(gm(x), f(x))
 
 
-# class TestCppFakeSymbolicTracing(TestCase):
-#     """Symbolic tracing tests ported from TestSymbolicTracing.
+# --- OpInfo-based exhaustive tests for C++ FakeTensor mode ---
 
-#     These use tracing_mode="symbolic" which creates its own FakeTensorMode
-#     internally. We wrap in cpp_fake_tensor_mode() to test that C++ fake
-#     tensors interoperate with the symbolic tracing machinery.
-#     """
+# Failures shared with the original make_fx tests (ops that don't work with
+# proxy tensor tracing regardless of fake mode implementation).
+cpp_fake_make_fx_failures = {
+    # unknown
+    xfail('allclose'),
+    xfail('equal'),
+    # empty
+    skip('new_empty'),
+    skip('empty_like'),
+    skip('empty'),
+    skip('empty_permuted'),
+    # flaky
+    skip('linalg.lstsq', 'grad_oriented'),
+    skip('nn.functional.max_unpool1d', '', device_type='cpu'),
+    skip('nn.functional.max_unpool2d', '', device_type='cpu'),
+    skip('nn.functional.max_unpool3d', '', device_type='cpu'),
+    skip('linalg.lstsq'),
+    # data-dependent control flow
+    skip('item'),
+    xfail('cov'),
+    xfail('nn.functional.gaussian_nll_loss'),
+    xfail('corrcoef'),
+    # sparse
+    xfail('sparse.sampled_addmm'),
+    xfail('sparse.mm', 'reduce'),
+    skip('to_sparse'),
+    # segfaults
+    skip('block_diag'),
+    # AssertionError: Tensor-likes are not close!
+    skip('empty_strided', '', device_type='cpu'),
+}
 
-#     def _test_dynamic(self, fn, trace_inputs, test_inputs, assert_eq=True):
-#         trace_inputs = [torch.randn(shape) for shape in trace_inputs]
-#         with cpp_fake_tensor_mode():
-#             traced_f = make_fx(fn, tracing_mode="symbolic")(*trace_inputs)
-#         for input in test_inputs:
-#             input = [torch.randn(shape) for shape in input]
-#             rx, ry = traced_f(*input), fn(*input)
-#             if assert_eq:
-#                 self.assertEqual(rx, ry)
-#         return traced_f
+cpp_fake_only_real_failures = {
+    xfail('narrow'),
+    xfail('tensor_split'),
+}
 
-#     def test_int_input(self):
-#         def f(x, y):
-#             return x.view(y)
+cpp_fake_only_fake_failures = {
+    xfail('tensor_split'),
+}
 
-#         with cpp_fake_tensor_mode():
-#             r = str(
-#                 make_fx(f, tracing_mode="symbolic")(torch.empty(3, 4), 12).code
-#             ).strip()
-#         self.assertExpectedInline(
-#             r,
-#             """\
-# def forward(self, x_1, y_1):
-#     view = torch.ops.aten.view.default(x_1, [y_1]);  x_1 = y_1 = None
-#     return view""",
-#         )
 
-#     def test_resize_from_zero(self):
-#         def f(x, y):
-#             x.resize_(y.size(0))
+def _get_safe_inplace(inplace_variant):
+    @functools.wraps(inplace_variant)
+    def _fn(t, *args, **kwargs):
+        return inplace_variant(t.clone(), *args, **kwargs)
+    return _fn
 
-#         with cpp_fake_tensor_mode():
-#             r = str(
-#                 make_fx(f, tracing_mode="symbolic")(torch.empty(0), torch.empty(2)).code
-#             ).strip()
-#         self.assertExpectedInline(
-#             r,
-#             """\
-# def forward(self, x_1, y_1):
-#     sym_size_int = torch.ops.aten.sym_size.int(y_1, 0);  y_1 = None
-#     resize_ = torch.ops.aten.resize_.default(x_1, [sym_size_int]);  x_1 = sym_size_int = resize_ = None
-#     return None""",
-#         )
 
-#     def test_broadcast_shapes(self):
-#         def f(x, y):
-#             return torch.functional.broadcast_shapes(x.size(), y.size()[0])
+def _test_make_fx_helper_cpp_fake(self, device, dtype, op, inplace=False,
+                                  out=False, decomp_table=None):
+    """Like _test_make_fx_helper but wraps make_fx in cpp_fake_tensor_mode()."""
+    fn = _get_safe_inplace(op.get_inplace()) if inplace else op.op
+    sample_inputs_itr = op.sample_inputs(device, dtype, requires_grad=False)
 
-#         with cpp_fake_tensor_mode():
-#             r = str(
-#                 make_fx(f, tracing_mode="symbolic")(
-#                     torch.empty(3, 1), torch.empty(5)
-#                 ).code
-#             ).strip()
-#         self.assertExpectedInline(
-#             r,
-#             """\
-# def forward(self, x_1, y_1):
-#     sym_size_int = torch.ops.aten.sym_size.int(x_1, 0);  x_1 = None
-#     sym_size_int_1 = torch.ops.aten.sym_size.int(y_1, 0);  y_1 = None
-#     return (sym_size_int, sym_size_int_1)""",
-#         )
+    count = 100
+    if out:
+        count = 5
+    for sample_input in itertools.islice(sample_inputs_itr, count):
+        if inplace and sample_input.broadcasts_input:
+            continue
+        args = [sample_input.input] + list(sample_input.args)
+        kwargs = sample_input.kwargs
+        if out:
+            expected = fn(*args, **kwargs)
+            kwargs['out'] = expected
 
-#     def test_unary(self):
-#         def f(x):
-#             if x.shape[0] >= 20:
-#                 raise AssertionError(f"expected x.shape[0] < 20, got {x.shape[0]}")
-#             return x.cos()
+        try:
+            _make_fx_check_cpp_fake(fn, args, kwargs, self.assertEqual,
+                                    randomize_data=True,
+                                    decomp_table=decomp_table)
+        except DynamicOutputShapeException:
+            self.skipTest("Dynamic output shape operation in trace")
 
-#         test_inputs = []
-#         test_inputs.append([(2, 5)])
-#         test_inputs.append([(6, 8)])
-#         self._test_dynamic(f, [(3, 4)], test_inputs)
 
-#     def test_multiply_shape(self):
-#         def f(a):
-#             return torch.empty(a.shape[0] * 2)
+def _make_fx_check_cpp_fake(func, args, kwargs, assert_close,
+                            randomize_data=False, decomp_table=None):
+    """Like optests.make_fx_check but traces under cpp_fake_tensor_mode()."""
+    from torch.testing._internal.optests.make_fx import (
+        handle_sizes_for_dynamic_shapes,
+        randomize,
+    )
+    from torch.testing._utils import wrapper_set_seed
 
-#         with cpp_fake_tensor_mode():
-#             r = str(make_fx(f, tracing_mode="symbolic")(torch.empty(4)).code).strip()
-#         self.assertExpectedInline(
-#             r,
-#             """\
-# def forward(self, a_1):
-#     sym_size_int = torch.ops.aten.sym_size.int(a_1, 0);  a_1 = None
-#     mul = sym_size_int * 2;  sym_size_int = None
-#     empty = torch.ops.aten.empty.memory_format([mul], device = device(type='cpu'), pin_memory = False);  mul = None
-#     return empty""",
-#         )
+    f, *new_args = handle_sizes_for_dynamic_shapes(func, args, kwargs)
 
-#     def test_item(self):
-#         def f(a):
-#             r = a.item()
-#             return r * a
+    def run(f, *args, **kwargs):
+        return wrapper_set_seed(f, *args, **kwargs)
 
-#         with cpp_fake_tensor_mode():
-#             r = str(make_fx(f, tracing_mode="symbolic")(torch.randn(1)).code).strip()
-#         self.assertExpectedInline(
-#             r,
-#             """\
-# def forward(self, a_1):
-#     _local_scalar_dense = torch.ops.aten._local_scalar_dense.default(a_1)
-#     mul = torch.ops.aten.mul.Tensor(a_1, _local_scalar_dense);  a_1 = _local_scalar_dense = None
-#     return mul""",
-#         )
+    with cpp_fake_tensor_mode():
+        traced_f = make_fx(f, tracing_mode="real",
+                           decomposition_table=decomp_table)(*new_args)
 
-#     def test_item_to_constructor(self):
-#         def f(a):
-#             r = a.item()
-#             return torch.empty(r)
+    msg = (
+        "op(*args, **kwargs) and make_fx(op)(*args, **kwargs) under "
+        "cpp_fake_tensor_mode produced different values."
+    )
 
-#         with cpp_fake_tensor_mode():
-#             r = str(
-#                 make_fx(f, tracing_mode="symbolic")(torch.randint(5, (1,))).code
-#             ).strip()
-#         self.assertExpectedInline(
-#             r,
-#             """\
-# def forward(self, a_1):
-#     _local_scalar_dense = torch.ops.aten._local_scalar_dense.default(a_1);  a_1 = None
-#     empty = torch.ops.aten.empty.memory_format([_local_scalar_dense], device = device(type='cpu'), pin_memory = False);  _local_scalar_dense = None
-#     return empty""",  # noqa: B950
-#         )
+    if randomize_data:
+        new_args = randomize(new_args)
+    try:
+        expected = run(f, *new_args)
+    except Exception:
+        if randomize_data:
+            return
+        raise
+    result = run(traced_f, *new_args)
+    assert_close(result, expected, msg=msg)
 
-#     def test_neg_shape(self):
-#         def f(a):
-#             return torch.empty(-a.shape[0] + 10)
 
-#         with cpp_fake_tensor_mode():
-#             r = str(make_fx(f, tracing_mode="symbolic")(torch.empty(2)).code).strip()
-#         self.assertExpectedInline(
-#             r,
-#             """\
-# def forward(self, a_1):
-#     sym_size_int = torch.ops.aten.sym_size.int(a_1, 0);  a_1 = None
-#     neg = -sym_size_int;  sym_size_int = None
-#     add = neg + 10;  neg = None
-#     empty = torch.ops.aten.empty.memory_format([add], device = device(type='cpu'), pin_memory = False);  add = None
-#     return empty""",
-#         )
+# provide decomp tables for now
+_cpp_fake_decomps = {
+    k: v for k, v in decomposition_table.items()
+    if k in {
+        aten._to_copy.default,
+        aten._softmax.default,
+        aten._log_softmax.default,
+    }
+}
 
-#     def test_binary_broadcast(self):
-#         def f(a, b):
-#             c = a * b
-#             return c
+filtered_hop_db = [op for op in hop_db if op.name != "auto_functionalize"]
 
-#         test_inputs = []
-#         test_inputs.append([(1, 5), (3, 1)])
-#         test_inputs.append([(1, 4), (4, 1)])
-#         self._test_dynamic(f, [(1, 2), (3, 1)], test_inputs)
 
-#     def test_expand(self):
-#         def f(a):
-#             b = torch.mul(a, a)
-#             c = b.expand(a.shape)
-#             return c
+@unittest.skipIf(not torch._dynamo.is_dynamo_supported(), "Cond requires dynamo")
+class TestCppFakeProxyTensorOpInfo(TestCase):
+    """Exhaustive op tests under C++ FakeTensor mode (no symbolic shapes)."""
 
-#         self._test_dynamic(f, [(3,)], [[(3,)], [(4,)], [(2,)]])
-#         self._test_dynamic(f, [(5, 1)], [[(4, 1)], [(3, 1)], [(6, 1)]])
+    @ops(op_db + filtered_hop_db + custom_op_db, allowed_dtypes=(torch.float,))
+    @skipOps('TestCppFakeProxyTensorOpInfo', 'test_make_fx_exhaustive',
+             cpp_fake_make_fx_failures | cpp_fake_only_real_failures)
+    def test_make_fx_exhaustive(self, device, dtype, op):
+        _test_make_fx_helper_cpp_fake(self, device, dtype, op,
+                                      decomp_table=_cpp_fake_decomps)
 
-#     def test_return_symint(self):
-#         def f(x):
-#             return x.shape[0], x.cos(), x.shape[0] / 5
+    @ops(op_db + filtered_hop_db + custom_op_db, allowed_dtypes=(torch.float,))
+    @skipOps('TestCppFakeProxyTensorOpInfo', 'test_make_fx_fake_exhaustive',
+             cpp_fake_make_fx_failures | cpp_fake_only_fake_failures)
+    def test_make_fx_fake_exhaustive(self, device, dtype, op):
+        _test_make_fx_helper_cpp_fake(self, device, dtype, op,
+                                      decomp_table=_cpp_fake_decomps)
 
-#         self._test_dynamic(f, [(5,)], [[(4,)], [(12,)]])
 
-#         def f(x):
-#             return x.shape
-
-#         self._test_dynamic(f, [(5, 3)], [[(4, 6)]])
-
-#     def test_rmethod(self):
-#         def f(x):
-#             return x.size(0) + x
-
-#         self._test_dynamic(f, [(5,)], [[(4,)], [(12,)]])
-
-#     def test_symint_to_tensor(self):
-#         def f(a):
-#             return a / a.shape[0]
-
-#         with cpp_fake_tensor_mode():
-#             r = str(make_fx(f, tracing_mode="symbolic")(torch.empty(4)).code).strip()
-#         self.assertExpectedInline(
-#             r,
-#             """\
-# def forward(self, a_1):
-#     sym_size_int = torch.ops.aten.sym_size.int(a_1, 0)
-#     div = torch.ops.aten.div.Tensor(a_1, sym_size_int);  a_1 = sym_size_int = None
-#     return div""",
-#         )
-
-#     def test_sqrt_size(self):
-#         def f(a):
-#             return a / a.size(-1) ** 0.5
-
-#         with cpp_fake_tensor_mode():
-#             r = str(make_fx(f, tracing_mode="symbolic")(torch.empty(4)).code).strip()
-#         self.assertExpectedInline(
-#             r,
-#             """\
-# def forward(self, a_1):
-#     sym_size_int = torch.ops.aten.sym_size.int(a_1, 0)
-#     sym_float = torch.sym_float(sym_size_int);  sym_size_int = None
-#     pow_1 = sym_float ** 0.5;  sym_float = None
-#     div = torch.ops.aten.div.Tensor(a_1, pow_1);  a_1 = pow_1 = None
-#     return div""",
-#         )
-
-#     def test_sym_storage_offset(self):
-#         def f(x, y):
-#             return x + y
-
-#         inp = (torch.randn(8)[3:], torch.randn(5))
-#         with cpp_fake_tensor_mode():
-#             fx_g = make_fx(f, tracing_mode="symbolic")(*inp)
-#         inp = (torch.randn(8)[3:], torch.randn(5))
-#         self.assertEqual(fx_g(*inp), f(*inp))
-
-#     def test_setitem_symint(self):
-#         def f(x):
-#             x[0] = x.size(0)
-#             return x
-
-#         with cpp_fake_tensor_mode():
-#             r = str(make_fx(f, tracing_mode="symbolic")(torch.randn(10)).code).strip()
-#         self.assertExpectedInline(
-#             r,
-#             """\
-# def forward(self, x_1):
-#     sym_size_int = torch.ops.aten.sym_size.int(x_1, 0)
-#     scalar_tensor = torch.ops.aten.scalar_tensor.default(sym_size_int, dtype = torch.float32, layout = torch.strided, device = device(type='cpu'));  sym_size_int = None
-#     select = torch.ops.aten.select.int(x_1, 0, 0)
-#     copy_ = torch.ops.aten.copy_.default(select, scalar_tensor);  select = scalar_tensor = copy_ = None
-#     return x_1""",  # noqa: B950
-#         )
-
-#     def test_non_symint_size_spec(self):
-#         def f(x):
-#             torch._C._non_sym_sizes(x)
-#             return x + 1
-
-#         x = torch.randn(2, 3)
-#         with cpp_fake_tensor_mode():
-#             make_fx(f, tracing_mode="symbolic")(x)
-
-#     def test_new_empty(self):
-#         def f(a, b):
-#             return a.new_empty(b.shape[0], b.shape[1] * 2)
-
-#         self._test_dynamic(
-#             f, [(2, 4), (4, 5)], [[(2, 3), (5, 7)], [(3, 7), (9, 3)]], assert_eq=False
-#         )
-
-#     def test_unbacked_slice(self):
-#         def f(x, m):
-#             x = x[m]
-#             return x[
-#                 slice(None, None, None), slice(None, None, None), slice(None, 2, None)
-#             ]
-
-#         with cpp_fake_tensor_mode():
-#             make_fx(f, tracing_mode="symbolic")(
-#                 torch.randn((12, 3, 3)), torch.randint(0, 2, (12,), dtype=torch.bool)
-#             )
-
-#     def test_dynamic_pointwise_scalar(self):
-#         def f(gravity, mask):
-#             gravity[mask, 0] = gravity[mask, 0] * -1
-
-#         with cpp_fake_tensor_mode():
-#             r = str(
-#                 make_fx(f, tracing_mode="symbolic")(
-#                     torch.randn((12, 4)), torch.randint(0, 2, (12,), dtype=torch.bool)
-#                 ).code
-#             ).strip()
-#         self.assertExpectedInline(
-#             r,
-#             """\
-# def forward(self, gravity_1, mask_1):
-#     select = torch.ops.aten.select.int(gravity_1, 1, 0)
-#     index = torch.ops.aten.index.Tensor(select, [mask_1]);  select = None
-#     mul = torch.ops.aten.mul.Tensor(index, -1);  index = None
-#     select_1 = torch.ops.aten.select.int(gravity_1, 1, 0);  gravity_1 = None
-#     index_put_ = torch.ops.aten.index_put_.default(select_1, [mask_1], mul);  select_1 = mask_1 = mul = index_put_ = None
-#     return None""",
-#         )
-
-#     def test_boolean_index(self):
-#         def f(images, handedness, valid):
-#             images = images[valid]
-#             handedness = handedness[valid]
-#             right_hand_mask = handedness == 1
-#             images[right_hand_mask] = images[right_hand_mask].flip(-1)
-
-#         with cpp_fake_tensor_mode():
-#             r = str(
-#                 make_fx(f, tracing_mode="symbolic")(
-#                     torch.randint(0, 256, (512, 1, 96, 96)),
-#                     torch.randint(0, 1, (512,)),
-#                     torch.randint(0, 2, (512,), dtype=torch.bool),
-#                 ).code
-#             ).strip()
-#         self.assertExpectedInline(
-#             r,
-#             """\
-# def forward(self, images_1, handedness_1, valid_1):
-#     index = torch.ops.aten.index.Tensor(images_1, [valid_1]);  images_1 = None
-#     index_1 = torch.ops.aten.index.Tensor(handedness_1, [valid_1]);  handedness_1 = valid_1 = None
-#     eq = torch.ops.aten.eq.Scalar(index_1, 1);  index_1 = None
-#     index_2 = torch.ops.aten.index.Tensor(index, [eq])
-#     flip = torch.ops.aten.flip.default(index_2, [-1]);  index_2 = None
-#     index_put_ = torch.ops.aten.index_put_.default(index, [eq], flip);  index = eq = flip = index_put_ = None
-#     return None""",
-#         )
+only_for = ("cpu",)
+instantiate_device_type_tests(TestCppFakeProxyTensorOpInfo, globals(), only_for=only_for)
 
 
 if __name__ == "__main__":
