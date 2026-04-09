@@ -952,6 +952,7 @@ if(USE_CUDNN)
   endif()
   set(CUDNN_FRONTEND_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../third_party/cudnn_frontend/include)
   target_include_directories(torch::cudnn INTERFACE ${CUDNN_FRONTEND_INCLUDE_DIR})
+  target_compile_definitions(torch::cudnn INTERFACE NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING)
 endif()
 
 # ---[ nvtx
