@@ -1444,6 +1444,11 @@ struct C10_API TensorImpl : public c10::intrusive_ptr_target {
   /**
    * Whether or not the imaginary part of the tensor should be negated
    */
+  inline bool is_conj() const {
+    constexpr auto conjugate_ks = DispatchKeySet(DispatchKey::Conjugate);
+    return key_set_.has_all(conjugate_ks);
+  }
+
   // Transmute this meta tensor into a fake tensor. The underlying device_opt_
   // stays as Meta for dispatch routing, while the fake device is stored in
   // ExtraMeta and returned by device() via the device_policy_ mechanism.
@@ -1465,11 +1470,6 @@ struct C10_API TensorImpl : public c10::intrusive_ptr_target {
     if (!extra_meta_)
       return nullptr;
     return extra_meta_->fake_tensor_mode_;
-  }
-
-  inline bool is_conj() const {
-    constexpr auto conjugate_ks = DispatchKeySet(DispatchKey::Conjugate);
-    return key_set_.has_all(conjugate_ks);
   }
 
   /**
