@@ -1,5 +1,3 @@
-#include <utility>
-
 #include <c10/core/Device.h>
 #include <c10/core/DispatchKey.h>
 #include <c10/util/Exception.h>
@@ -207,7 +205,8 @@ static c10::IValue to_ivalue(
           static_cast<c10::DeviceType>(static_cast<int8_t>(
               static_cast<uint32_t>((stable_ivalue >> 32) & 0xFFFFFFFF)));
       TORCH_CHECK(
-          std::in_range<int8_t>(device_index),
+          device_index >= std::numeric_limits<int8_t>::min() &&
+              device_index <= std::numeric_limits<int8_t>::max(),
           "Device index ",
           device_index,
           " is out of range for int8_t [",
