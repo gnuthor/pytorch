@@ -163,6 +163,7 @@ def can_pad(
     if (
         torch._inductor.config.deterministic
         and not torch._inductor.config.force_shape_pad
+        and "pad_mm" not in torch._inductor.config.autoheuristic_use
     ):
         return False
 
@@ -458,7 +459,11 @@ def should_pad(
     op: torch._ops.OpOverloadPacket,
     input: Tensor | None = None,
 ) -> bool:
+    # if 1027 in mat1.shape or 1027 in mat2.shape:
+    #     print("?")
     _can_pad = can_pad(mat1, mat2, op, input)
+    # if can_pad:
+    #     print("?")
     # Note that if you're tempted to insert a dynamo_timed call here, this function can
     # be called enough that the dynamo_timed overhead is not negligible.
     return _can_pad and _should_pad(match, mat1, mat2, op, input)
@@ -671,6 +676,12 @@ def _should_pad(
             )
             if ah_should_pad is not None:
                 return ah_should_pad
+
+        if (
+            torch._inductor.config.deterministic
+            and not torch._inductor.config.force_shape_pad
+        ):
+            return False
 
         if ori_time is None:
             ori_time = do_bench(orig_bench_fn)
