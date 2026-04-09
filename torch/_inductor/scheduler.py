@@ -3075,6 +3075,28 @@ def template_fusion_pw_node(node1: BaseSchedulerNode, node2: BaseSchedulerNode):
     return node2 if is_epilogue_fusion(node1, node2) else node1
 
 
+def _get_fx_node_names(node: BaseSchedulerNode) -> str:
+    """Extract comma-separated FX node names for CUDA graph annotation.
+
+    Uses origin_node (the direct FX node) rather than origins (which includes
+    transitive unrealized inputs) to avoid misleading annotations like
+    'mm_1, relu' when mm_1 merely consumes relu's output.  Falls back to
+    origins when origin_node is not set.
+    """
+    names: list[str] = []
+    for snode in node.get_nodes():
+        if snode.node is not None:
+            origin = snode.node.get_origin_node()
+            if origin is not None:
+                if origin.name not in names:
+                    names.append(origin.name)
+            else:
+                for o in snode.node.get_origins():
+                    if o.op == "call_function" and o.name not in names:
+                        names.append(o.name)
+    return ", ".join(names)
+
+
 class Scheduler:
     """
     A Scheduler is a graph of BaseSchedulerNodes. It is responsible for
@@ -7584,6 +7606,17 @@ class Scheduler:
             self.current_node = node
             self.buffer_names_to_free.update(node.last_usage)
 
+            annotation_name = ""
+            if (
+                config.triton.cudagraph_kernel_annotations
+                and not isinstance(node, NopKernelSchedulerNode)
+            ):
+                annotation_name = _get_fx_node_names(node)
+                if annotation_name:
+                    V.graph.wrapper_code.write_cudagraph_annotation_begin(
+                        annotation_name
+                    )
+
             if node.is_template():
                 prologue, template_node, epilogue = node.get_prologue_template_epilogue(
                     list(node.get_nodes())
@@ -7615,6 +7648,9 @@ class Scheduler:
             else:
                 assert isinstance(node, NopKernelSchedulerNode)
                 node.mark_run()
+
+            if annotation_name:
+                V.graph.wrapper_code.write_cudagraph_annotation_end()
 
             # pyrefly: ignore [unbound-name]
             if config.triton.debug_sync_kernel:
