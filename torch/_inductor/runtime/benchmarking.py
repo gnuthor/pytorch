@@ -666,11 +666,12 @@ class TorchProfilerBenchmarker(InductorBenchmarker):  # noqa: docstring_linter
                     kineto_event.end_ns() - kineto_event.start_ns()
                 ) / 1000.0
 
-        assert callable_gpu_time_us > 0, (
-            "TorchProfilerBenchmarker: '_CALLABLE' CUDA event not found in "
-            "raw kineto results. This indicates record_function('_CALLABLE') did "
-            "not produce a GPU_USER_ANNOTATION profiler event."
-        )
+        if callable_gpu_time_us <= 0:
+            raise AssertionError(
+                "TorchProfilerBenchmarker: '_CALLABLE' CUDA event not found in "
+                "raw kineto results. This indicates record_function('_CALLABLE') did "
+                "not produce a GPU_USER_ANNOTATION profiler event."
+            )
 
         # This launch-overhead aggregation was an experiment to better align
         # profiler timings with event-based timings, but it has not been robust
