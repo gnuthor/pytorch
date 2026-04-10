@@ -251,6 +251,14 @@ class AOTInductorTestsTemplate:
             _, code = run_and_get_cpp_code(
                 AOTIRunnerUtil.compile, model, example_inputs
             )
+            if self.use_minimal_arrayref_interface:
+                FileCheck().check(
+                    "AOTInductorModelRunMinimalArrayrefInterfaceV2("
+                ).check("constexpr int32_t expected_num_inputs = 2;").check(
+                    "constexpr int32_t expected_num_outputs = 1;"
+                ).check("if (num_inputs != expected_num_inputs)").check(
+                    "if (num_outputs != expected_num_outputs)"
+                ).run(code)
             if self.device == "mps":
                 FileCheck().check("aoti_torch_mps_get_kernel_function(").run(code)
             elif self.device == GPU_TYPE:
