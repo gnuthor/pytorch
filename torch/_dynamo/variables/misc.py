@@ -1561,6 +1561,16 @@ class TypingVariable(VariableTracker):
         super().__init__(**kwargs)
         self.value = value
 
+    def mp_subscript_impl(
+        self,
+        tx: "InstructionTranslator",
+        key: VariableTracker,
+    ) -> VariableTracker:
+        # e.g., List[int] → typing.List[int]
+        # TODO(follow-up): add test for invalid subscript type
+        new_typing = self.value[key.as_python_constant()]
+        return TypingVariable(new_typing)
+
     def call_method(
         self,
         tx: "InstructionTranslator",
@@ -1568,11 +1578,7 @@ class TypingVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
-        # Create a new typing variable, e.g., `List[int]`
-        if name == "__getitem__" and len(args) == 1:
-            new_typing = self.value[args[0].as_python_constant()]
-            return TypingVariable(new_typing)
-        elif name == "__eq__":
+        if name == "__eq__":
             if len(args) == 1 and not kwargs:
                 result = istype(args[0], TypingVariable) and self.value == args[0].value
                 return variables.ConstantVariable.create(result)

@@ -1505,6 +1505,25 @@ class UserDefinedObjectVariable(UserDefinedVariable):
         }
         return fns
 
+    def mp_subscript_impl(
+        self,
+        tx: "InstructionTranslator",
+        key: VariableTracker,
+    ) -> VariableTracker:
+        # PyObject_GetItem: https://github.com/python/cpython/blob/62a6e898e01/Objects/abstract.c#L155-L206
+        method = self._maybe_get_baseclass_method("__getitem__")
+        if (
+            self._base_vt is not None
+            and self._base_methods is not None
+            and method in self._base_methods
+        ):
+            return self._base_vt.mp_subscript_impl(tx, key)
+        if method is not None:
+            return self.resolve_type_attr(
+                tx, "__getitem__", method, self.source
+            ).call_function(tx, [key], {})
+        return super().mp_subscript_impl(tx, key)
+
     def call_method(
         self,
         tx: "InstructionTranslator",
@@ -2965,6 +2984,27 @@ class UserDefinedDictVariable(UserDefinedObjectVariable):
         # Dict implements __len__ via mp_length (mapping protocol), not
         # sq_length (sequence protocol). Redirect so generic_len works.
         return self.mp_length(tx)
+
+    def mp_subscript_impl(
+        self,
+        tx: "InstructionTranslator",
+        key: VariableTracker,
+    ) -> VariableTracker:
+        # dict_subscript: https://github.com/python/cpython/blob/62a6e898e01/Objects/dictobject.c#L3673-L3706
+        # TODO(follow-up): add test for unhashable/invalid key type, Counter missing key
+        method = self._maybe_get_baseclass_method("__getitem__")
+        if method in self._base_methods:
+            assert self._base_vt is not None
+            try:
+                return self._base_vt.mp_subscript_impl(tx, key)
+            except ObservedKeyError:
+                if issubclass(
+                    self.python_type(), dict
+                ) and self._maybe_get_baseclass_method("__missing__"):
+                    return self.call_method(tx, "__missing__", [key], {})
+                else:
+                    raise
+        return super().mp_subscript_impl(tx, key)
 
     def call_method(
         self,
