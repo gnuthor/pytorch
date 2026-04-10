@@ -6724,10 +6724,17 @@ class ExternKernel(InputsKernel):
                         exact_strides, x.get_layout().stride, x.get_size()
                     )
                 )
+                or (
+                    allow_padding
+                    and exact_strides
+                    and x.get_layout().is_stride_ordered(
+                        get_stride_order(exact_strides)
+                    )
+                )
             ):
                 return (
                     try_match_insignificant_strides(x, exact_strides)
-                    if exact_strides is not None
+                    if exact_strides is not None and not allow_padding
                     else x
                 )
             elif isinstance(

@@ -778,6 +778,41 @@ class PaddingTest(TestCaseBase):
         output_line = f"buf12 = empty_strided_{GPU_TYPE}({output_shape}, {output_stride}, torch.float32)"
         self.assertTrue(output_line in code[0])
 
+    @requires_gpu()
+    def test_concat_output_no_redundant_copy_with_padding(self):
+        """
+        When comprehensive_padding is enabled, ConcatKernel pads its output
+        buffer strides. The graph output should accept the padded strides
+        directly instead of generating a redundant copy kernel.
+        """
+
+        def f(x, w):
+            a = x + 1
+            b = torch.mm(x, w)
+            return torch.cat([a, b], dim=1)
+
+        x = torch.randn(128, 240, device=GPU_TYPE)
+        w = torch.randn(240, 101, device=GPU_TYPE)
+
+        with config.patch(
+            {
+                "comprehensive_padding": True,
+                "padding_stride_threshold": 0,
+            }
+        ):
+            result, code = run_and_get_code(torch.compile(f), x, w)
+
+        ref = f(x, w)
+        self.assertTrue(torch.allclose(ref, result, atol=1e-3, rtol=1e-3))
+        # Only one output buffer should be allocated for the concat result.
+        # Without the fix, a second empty_strided is allocated and a copy
+        # kernel is generated to copy from the padded concat buffer to it.
+        self.assertEqual(
+            code[0].count(f"empty_strided_{GPU_TYPE}"),
+            1,
+            "Expected exactly one buffer allocation for concat output (no redundant copy)",
+        )
+
     @parametrize(
         "shape,alignment_bytes,enable_pad",
         [
