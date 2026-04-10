@@ -88,6 +88,10 @@ TORCH_CUDA_CPP_API cusparseHandle_t getCurrentCUDASparseHandle();
 TORCH_CUDA_CPP_API cublasHandle_t getCurrentCUDABlasHandle(bool setup = true);
 TORCH_CUDA_CPP_API cublasLtHandle_t getCurrentCUDABlasLtHandle();
 
+#if defined(USE_ROCM)
+TORCH_CUDA_CPP_API void prepareHipblasLtHandleForGraphCapture();
+#endif
+
 TORCH_CUDA_CPP_API void clearCublasWorkspaces();
 TORCH_CUDA_CPP_API void clearCublasWorkspacesForStream(cudaStream_t stream);
 struct WorkspaceMapWithMutex {

@@ -1,3 +1,4 @@
+#include <ATen/Context.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/nvrtc_stub/ATenNVRTC.h>
 #include <ATen/cuda/detail/DeviceThreadHandles.h>
@@ -457,5 +458,18 @@ cublasLtHandle_t getCurrentCUDABlasLtHandle() {
   return reinterpret_cast<cublasLtHandle_t>(getCurrentCUDABlasHandle(/*setup=*/false));
 #endif
 }
+
+#ifdef USE_ROCM
+void prepareHipblasLtHandleForGraphCapture() {
+  if (at::globalContext().blasPreferredBackend() != at::BlasBackend::Cublaslt) {
+    return;
+  }
+  // hipBLASLt handles are per-(device, stream) on ROCm and lazily created.
+  // Ensure the handle for the intended capture stream exists before
+  // capture begins, because hipblasLtCreate performs internal allocations
+  // that are not allowed once stream capture is active.
+  (void)getCurrentCUDABlasLtHandle();
+}
+#endif
 
 } // namespace at::cuda

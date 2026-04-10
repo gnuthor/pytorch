@@ -120,6 +120,10 @@ void CUDAGraph::capture_begin(MempoolId_t pool/*={0,0}*/, cudaStreamCaptureMode 
   capture_stream_ = stream;
   capture_dev_ = c10::cuda::current_device();
 
+#if defined(USE_ROCM)
+  at::cuda::prepareHipblasLtHandleForGraphCapture();
+#endif
+
   if (pool.first != 0 || pool.second != 0) {
     // Either value being nonzero means the user supplied a pool to share.
     // But only one should be nonzero.
