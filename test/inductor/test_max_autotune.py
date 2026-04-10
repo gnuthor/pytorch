@@ -774,6 +774,34 @@ class TestMaxAutotune(TestCase):
         with config.patch({"max_autotune": True}):
             torch.compile(mm, dynamic=dynamic)(a, b)
 
+    @fresh_cache()
+    def test_addmm_1d_bias_no_reinterpret_tensor(self):
+        """
+        Verify that aten addmm with 1D bias does not wrap bias in reinterpret_tensor.
+        This ensures cublasLt uses its optimized bias epilogue (requires dim==1).
+        """
+
+        def addmm(x, a, b):
+            return torch.addmm(x, a, b)
+
+        x = torch.randn(100).to(GPU_TYPE)
+        a = torch.randn(100, 10).to(GPU_TYPE)
+        b = torch.randn(10, 100).to(GPU_TYPE)
+
+        with config.patch(
+            {
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "ATEN",
+            }
+        ):
+            Y_compiled, code = run_and_get_code(torch.compile(addmm), x, a, b)
+            Y = addmm(x, a, b)
+            torch.testing.assert_close(Y_compiled, Y, atol=1e-2, rtol=1e-2)
+
+            # Verify addmm is called without reinterpret_tensor on bias
+            FileCheck().check("addmm").run(code[0])
+            self.assertNotIn("addmm(reinterpret_tensor", code[0])
+
     @unittest.skipIf(
         not has_triton_tma_device(), "Need device-side TMA support in Triton"
     )
