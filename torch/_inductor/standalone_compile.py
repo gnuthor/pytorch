@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import logging
 import os
 import pickle
@@ -442,9 +441,8 @@ def standalone_compile(
         config.patch("triton.autotune_at_compile_time", True),
         torch._functorch.config.patch("bundled_autograd_cache", aot),
     ):
-        # compile_fx can mutate gm
-        # TODO: this is only needed if we dont hit the cache!!
-        gm = copy.deepcopy(gm)
+        # compile_fx takes ownership of gm and may mutate it on cache
+        # miss. Callers who need the original should copy before calling.
         compiled_fn = compile_fx(
             gm, example_inputs, ignore_shape_env=ignore_shape_env, **options
         )
